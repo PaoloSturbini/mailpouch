@@ -15,8 +15,9 @@ import {
 } from "./schema.js";
 
 describe("ALL_TOOLS", () => {
-  it("has exactly 83 canonical entries", () => {
-    expect(ALL_TOOLS).toHaveLength(83);
+  it("has exactly 84 canonical entries", () => {
+    // FIX (2026-08-25, remediation item 7): +1 for fts_rebuild_full.
+    expect(ALL_TOOLS).toHaveLength(84);
   });
 
   it("contains no duplicates", () => {
@@ -195,9 +196,13 @@ describe("Tool tiering", () => {
     });
 
     it("keeps the documented canonical tier counts honest", () => {
-      expect(toolsForTier("core").size).toBe(30);
-      expect(toolsForTier("extended").size).toBe(80);
-      expect(toolsForTier("complete").size).toBe(86);
+      // FIX (2026-08-25, remediation item 7): +1 for fts_rebuild_full, the new
+      // full-mailbox (not just analytics-cache) FTS index rebuild tool — it
+      // lives in the same "reading" category (risk: safe) as fts_rebuild, so
+      // it lands in the "core" tier alongside it.
+      expect(toolsForTier("core").size).toBe(31);
+      expect(toolsForTier("extended").size).toBe(81);
+      expect(toolsForTier("complete").size).toBe(87);
     });
   });
 

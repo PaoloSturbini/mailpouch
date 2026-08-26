@@ -1,3 +1,143 @@
+## Fork changelog — netcup/paolost deployment fixes (2026-08-25/26)
+
+This fork tracks upstream [chandshy/mailpouch](https://github.com/chandshy/mailpouch)
+and layers on a set of fixes discovered and validated against a real
+Proton Bridge deployment with a 10,189-message multi-account mailbox. All
+changes are additive/backward-compatible with the upstream MCP contract
+(existing cursors, tool names, and response shapes keep working).
+
+### 1. IMAP pagination bug — `get_emails` / `get_emails_by_label` (root cause fix)
+
+**Symptom:** enumerating a large folder via `get_emails` with `cursor`
+pagination would silently stop after roughly 500 messages, or occasionally
+return an empty page / repeat messages, especially under concurrent reads
+across folders (e.g. two agents enumerating `INBOX` and `Sent` at once).
+
+**Root cause:** `SimpleIMAPService.getEmails()` paginated by IMAP
+**sequence number**, computed as `start = total - offset - limit + 1` /
+`end = total - offset`, where `total = mailbox.exists` at SELECT time.
+Sequence numbers are only stable while the mailbox is quiescent — any
+concurrent `SELECT`/new-mail/EXPUNGE on the **same IMAP account**
+(all folders share one connection — `SimpleIMAPService` has a single
+`this.client`) shifts `mailbox.exists` between pages, so the next page's
+`start:end` window silently skips or repeats messages relative to what the
+cursor's `offset` assumed.
+
+**Fix (`src/services/simple-imap-service.ts`, `src/index.ts`,
+`src/tools/reading.ts`, `src/tools/types.ts`):**
+- `getEmails()` now pages by **UID watermark** (`beforeUid`) instead of
+  sequence-number offset. UIDs are immutable/monotonic for the life of a
+  `UIDVALIDITY` epoch (already tracked via `checkAndUpdateUidValidity`),
+  so a page's window is independent of any other connection's concurrent
+  mailbox state.
+- The UID scan uses an **exponentially-growing bounded window** (start at
+  `max(limit*2, 100)`, double on miss, cap 20 attempts) instead of
+  re-scanning the entire `1:upper` range on every page — the naive
+  "correct" UID rewrite was O(n²/limit) and stalled indefinitely on a
+  10k-message full-mailbox rebuild.
+- `EmailCursor` (`src/index.ts`) is now a fully **self-contained**
+  descriptor: `{ folder, account, beforeUid | offset, limit, sort }`.
+  Adding `account` prevents a cursor minted for one account from ever
+  being silently replayed against another. `decodeCursor()` still accepts
+  legacy `{folder, offset, limit}` cursors from a pre-fix server for
+  in-flight pagination sessions across a deploy (falls back to the offset
+  path for that one page, then mints a proper `beforeUid` cursor going
+  forward).
+- `hasMore` is now derived from the IMAP layer's own accounting
+  (`pageMeta.hasMore`, backed by a lower-UID-range probe) instead of the
+  `emails.length === limit` heuristic, which broke whenever a page came
+  back short for a reason *other than* being the last page (parse
+  failures, a concurrent mailbox change shrinking the old sequence
+  window).
+- `get_emails` / `get_emails_by_label` now report `limitApplied` /
+  `requestedLimit` / `limitClampedReason` in the response when the
+  requested `limit` was clamped, instead of silently truncating.
+
+**Verification:** concurrent enumeration of `INBOX` + `Sent` + a
+user-defined folder, collecting all UIDs from paginated reads, produced
+sets that exactly match `STATUS` counts (INBOX 1445, Sent 1116, custom
+folder 2156) — zero drops, zero duplicates, across interleaved
+folder/account reads.
+
+### 2. Explicit read-queue serialization (`_readQueue` / `enqueueRead`)
+
+`getMailboxLock()` prevents two `SELECT`s from corrupting each other's
+server-side state, but does not prevent request *starvation*: letting N
+concurrent `get_emails` calls race directly against the single shared
+`this.client` socket produced multi-second stalls and occasional IMAP
+timeouts under concurrent-folder enumeration. `simple-imap-service.ts` now
+serializes read operations through an explicit per-instance FIFO queue,
+making ordering deterministic without free-for-all socket contention.
+
+### 3. Proton Bridge `connectionlimiter` — `clientInfo` identification
+
+**Symptom:** IMAP timeouts and slow (4–8s per 50-message page) concurrent
+reads across folders, plus a truncated FTS backfill.
+
+**Root cause:** `imapflow`'s default IMAP ID announces
+`name="imapflow"`, which Bridge's `connectionlimiter` buckets under an
+"unknown" client — sharing a small/unbounded slot pool instead of a
+per-client dedicated allowance (Bridge logs showed
+`limits="{map[apple-mail:60 outlook:0 thunderbird:0] 0}"` with 100% of
+sessions landing in "unknown").
+
+**Fix:** both `ImapFlow` connections (`connect()` and the IDLE/idle-notify
+client) now self-identify via `clientInfo: { name: "apple-mail", vendor:
+"Apple Inc." }`, giving them Bridge's dedicated 60-connection allowance.
+
+### 4. `search_emails` — ESEARCH PARTIAL removed, response projected
+
+- `search_emails` no longer uses `returnOptions: [{ partial: ... }]` —
+  Bridge produced stateful/inconsistent results across consecutive
+  ESEARCH PARTIAL queries (first date window OK, later windows
+  incorrectly empty). Reverted to plain `UID SEARCH` + client-side slice;
+  mailboxes are bounded and this favors correctness over the small
+  bandwidth saving.
+- `search_emails`'s response is now projected to list-view fields (id,
+  from/to, subject, date, folder, flags, a 300-char `bodyPreview`) instead
+  of full parsed message bodies — a handful of HTML messages in a result
+  set could otherwise exceed the MCP response size guard and make a
+  successful search look like an empty/failed one.
+
+### 5. `fts_rebuild_full` — new tool, full-mailbox FTS rebuild
+
+**Root cause:** the existing `fts_rebuild` only ever indexes what the
+analytics cache layer has synced, hardcapped at 200 INBOX + 100 Sent
+messages — structurally unable to index a large, many-folder mailbox
+(observed: 330 of 10,189 messages indexed).
+
+**Fix:** new tool `fts_rebuild_full` (`src/tools/reading.ts`,
+registered in `src/config/schema.ts`) walks every folder from
+`get_folders()` using the corrected UID-cursor `getEmails()` pagination,
+indexing the full corpus incrementally per folder (a mid-run failure on
+one folder still leaves earlier folders indexed). Verified: 330 → 24,564
+messages indexed (includes cross-label duplicates inherent to Proton's
+label model, not just INBOX/Sent).
+
+### Operational notes carried over from the deployment (not code changes)
+
+- Proton Bridge's self-signed TLS cert should be pinned per-account via
+  `bridgeCertPath` in the account's `accounts[]` entry (not the legacy
+  top-level `connection.*` field, which stops being read once `accounts[]`
+  exists) — with `allowInsecureBridge` left `false`. Avoid the
+  `MAILPOUCH_INSECURE_BRIDGE=1` escape hatch in production.
+- The on-disk agent grant store (`AgentGrantStore`) only accepts the
+  literal status values `"pending" | "active" | "revoked" | "expired"`
+  (`GRANT_STATUSES` in `src/agents/grant-store.ts`). Writing any other
+  value directly to the grants JSON file (e.g. a hand-rolled `"denied"`)
+  fails `isValidAuthorizationGrant()` on load and — by design, fail-closed
+  — makes the server reject **every** bearer token for **every** agent
+  until the file is fixed, not just the malformed record. If you ever
+  need to manage grants outside the Settings UI/API, only ever write one
+  of the four canonical status strings.
+- One known unrelated edge case: a folder name containing a literal
+  backslash (e.g. `Labels/Commercialista\`) fails folder-path parsing —
+  not touched by this fork, flagged for future investigation.
+
+---
+
+Original upstream README follows below.
+
 # mailpouch
 
 `mailpouch` is an MCP server that gives AI agents a typed, permission-gated, audit-logged tool surface over private-mail providers — Proton Mail (via Proton Bridge) and plain IMAP.

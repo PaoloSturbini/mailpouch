@@ -94,6 +94,6 @@ describe("advertisedToolDefs — optional companions", () => {
     const names = advertisedToolDefs({ simpleLogin: true, pass: true }).map((def) => def.name);
     expect(names).toContain("alias_list");
     expect(names).toContain("pass_list");
-    expect(names).toHaveLength(86);
+    expect(names).toHaveLength(87);
   });
 });

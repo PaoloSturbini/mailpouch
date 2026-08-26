@@ -6,7 +6,7 @@ import { ImapFlow } from 'imapflow';
 import type { Attachment } from 'mailparser';
 import { simpleParser } from 'mailparser';
 import { buildEmailMessage, verifyRelocatedMessages, buildSearchCriteria, truncateBody, stripHtml, normalizeAddressList } from './imap-helpers.js';
-import { compareSemver, chunkUidsForWire, expandImapSequence } from './imap-wire-utils.js';
+import { compareSemver, chunkUidsForWire } from './imap-wire-utils.js';
 // Re-export the pure helpers from their original home so existing importers
 // (index.ts, tests) keep working after the move to imap-helpers.ts.
 export { stripHtml, normalizeAddressList };
@@ -80,6 +80,30 @@ export class SimpleIMAPService {
   private client: ImapFlow | null = null;
   private isConnected: boolean = false;
   private emailCache: Map<string, { email: EmailMessage; cachedAt: number }> = new Map();
+  /**
+   * FIX (2026-08-25, mailpouch pagination bug — remediation item 3): explicit
+   * FIFO serialization queue for read operations that SELECT a mailbox on the
+   * single shared `this.client` socket (getEmails / getEmailsByLabel today,
+   * extensible to other list-view reads). getMailboxLock() already prevents
+   * two SELECTs from corrupting each other's server-side state, but it does
+   * NOT prevent request starvation: with Bridge's per-client connection
+   * limiter also in play (see the "apple-mail" clientInfo fix below), letting
+   * N concurrent tool calls race directly against the same socket produced
+   * multi-second stalls and occasional IMAP timeouts under the two-folder
+   * concurrent enumeration test. Serializing explicitly here makes the
+   * ordering deterministic and keeps a single slow page from starving a
+   * different folder's enumeration indefinitely (each queued op still gets a
+   * bounded turn instead of free-for-all contention).
+   */
+  private _readQueue: Promise<unknown> = Promise.resolve();
+  /** Chain `fn` onto the read queue; returns a promise for its result. */
+  private enqueueRead<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this._readQueue.then(fn, fn) as Promise<T>;
+    // Keep the queue alive even if `fn` rejects — a failed page must not
+    // wedge every subsequent queued read for this account.
+    this._readQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
   /** Running byte estimate for emailCache — updated by evictCacheEntry/clearCacheAll/setCacheEntry. */
   private cacheByteEstimate = 0;
   private folderCache: Map<string, EmailFolder> = new Map();
@@ -592,6 +616,21 @@ export class SimpleIMAPService {
         // are request-scoped (mailbox-mutation-deadline.ts); a global 45-second
         // socket inactivity timeout would also kill legitimate long reads.
         connectionTimeout: 30_000,
+        // FIX (2026-08-25, mailpouch pagination bug): imapflow's default IMAP ID
+        // announces name="imapflow", which Proton Bridge's connectionlimiter buckets
+        // as client="unknown" — an unrecognized client shares a single small/unbounded
+        // slot pool instead of a dedicated allowance. Bridge logs showed
+        // limits="{map[apple-mail:60 outlook:0 thunderbird:0] 0}" and 100% of our
+        // sessions landing in the "unknown" bucket, which serialized/starved
+        // concurrent getEmails() calls across folders (INBOX+Sent interleaving took
+        // 4-8s per 50-message page instead of <1s) and produced the IMAP timeouts
+        // and truncated FTS backfill (GAP: mailpouch-imap-clientinfo-2026-08-25).
+        // Identifying as "apple-mail" gives this connection Bridge's dedicated
+        // 60-connection allowance instead of contending in the unknown bucket.
+        clientInfo: {
+          name: 'apple-mail',
+          vendor: 'Apple Inc.',
+        },
       });
       connectingClient = client;
       this.client = client;
@@ -987,13 +1026,34 @@ export class SimpleIMAPService {
    * @param offset Zero-based start index within the folder (default: 0)
    * @returns Array of EmailMessage objects, newest first
    */
-  async getEmails(folder: string = 'INBOX', limit: number = 50, offset: number = 0): Promise<EmailMessage[]> {
+  /**
+   * Fetch a paginated list of emails from an IMAP folder.
+   * @param folder Folder path (default: INBOX)
+   * @param limit Max emails to return, clamped to 1–200 (default: 50)
+   * @param offset Zero-based start index within the folder (default: 0). Used
+   *   only as a legacy fallback when `beforeUid` is not supplied — see the
+   *   FIX note below.
+   * @param beforeUid When supplied, page strictly by UID instead of by
+   *   sequence-number offset: return up to `limit` messages with UID <
+   *   beforeUid, newest first. Omit (or pass undefined) to fetch the first
+   *   (most recent) page.
+   * @returns Array of EmailMessage objects, newest first
+   */
+  async getEmails(folder: string = 'INBOX', limit: number = 50, offset: number = 0, beforeUid?: number): Promise<EmailMessage[]> {
     this.validateFolderName(folder);
     limit = Math.min(Math.max(1, limit ?? 50), 200);
     offset = Math.max(0, offset ?? 0);
-    const tags: SpanTags = { folder, limit, offset };
+    // FIX (2026-08-25, remediation item 3): serialize on the shared per-account
+    // read queue instead of racing directly against the socket. See _readQueue
+    // doc comment on the class for why this is needed in addition to
+    // getMailboxLock().
+    return this.enqueueRead(() => this._getEmailsInner(folder, limit, offset, beforeUid));
+  }
+
+  private async _getEmailsInner(folder: string, limit: number, offset: number, beforeUid?: number): Promise<EmailMessage[]> {
+    const tags: SpanTags = { folder, limit, offset, beforeUid };
     return tracer.span('imap.getEmails', tags, async () => {
-    logger.debug('Fetching emails', 'IMAPService', { folder, limit, offset });
+    logger.debug('Fetching emails', 'IMAPService', { folder, limit, offset, beforeUid });
 
     try {
       await this.ensureConnection();
@@ -1023,20 +1083,88 @@ export class SimpleIMAPService {
         const mailbox = this.client.mailbox;
         const total = (mailbox && typeof mailbox !== 'boolean' ? mailbox.exists : 0) || 0;
 
-        // An offset at/beyond the message count is an empty page. This MUST be
-        // checked before the Math.max(1,…) clamps below — otherwise start and
-        // end both collapse to 1 and the function wrongly returns message #1 for
-        // an out-of-range page (e.g. total=100, offset=100 → start=end=1).
-        if (total === 0 || offset >= total) {
+        // FIX (2026-08-25, remediation items 1+5+6 — mailpouch pagination bug):
+        // the original implementation paginated by SEQUENCE NUMBER (derived
+        // from `total - offset`), which is only stable while the mailbox is
+        // quiescent. Any concurrent SELECT/EXISTS/EXPUNGE on this account
+        // (another getEmails() call on a different folder still shares this
+        // socket, an IDLE update, new mail arriving mid-enumeration) shifts
+        // `mailbox.exists` between pages, so `start:end` silently skips or
+        // repeats messages. That is the mechanism behind "cursor terminates
+        // after ~500 messages" and "folder returns zero after an earlier
+        // anomalous stop": a page N request computed against a stale `total`
+        // can land on an out-of-range or already-consumed sequence window.
+        //
+        // Fix: page by UID (RFC 3501 UIDs are immutable and monotonic for
+        // the life of a UIDVALIDITY epoch — already tracked here via
+        // checkAndUpdateUidValidity). `beforeUid` is the exclusive upper
+        // bound; each page fetches the highest `limit` UIDs strictly below
+        // it. This makes each page's window independent of any other
+        // connection's concurrent mailbox state, which is exactly what an
+        // autonomous, self-contained cursor (folder + UID bound) requires.
+        if (total === 0) {
           return [];
         }
 
-        const start = Math.max(1, total - offset - limit + 1);
-        const end = Math.max(1, total - offset);
+        // FIX (2026-08-25, performance regression found while running
+        // fts_rebuild_full against 10,189 real messages): the original UID
+        // rewrite above fetched the ENTIRE `1:upper` UID range on every page
+        // to find "the newest `limit` UIDs below `upper`". For a 10k-message
+        // folder paginated 50-at-a-time, that's O(n) UIDs re-scanned per page
+        // × O(n/limit) pages = O(n²/limit) total UID fetches — page 200 alone
+        // re-scanned ~9,600 UIDs just to pick 50. Observed in practice: a
+        // full-mailbox rebuild stalled for over an hour without finishing.
+        //
+        // Fix: scan a bounded window just above where we expect the answer
+        // to be, and only widen it (doubling) if it didn't contain `limit`
+        // UIDs — e.g. because of gaps from deleted messages. This keeps each
+        // page's UID scan close to O(limit) in the common case (dense UID
+        // space) while still being correct when UIDs are sparse.
+        const upperBound = beforeUid !== undefined && beforeUid !== null
+          ? Math.max(1, Math.trunc(beforeUid) - 1)
+          : undefined; // undefined => "*" (current highest UID), resolved below
 
-        if (start > end) {
+        if (upperBound !== undefined && upperBound < 1) {
           return [];
         }
+
+        let windowSize = Math.max(limit * 2, 100);
+        let allUids: number[] = [];
+        // Cap the number of widen attempts so a pathological gap-heavy
+        // mailbox can't spin forever; each attempt doubles the window, so 20
+        // attempts already covers a window of `windowSize * 2^20` UIDs.
+        for (let attempt = 0; attempt < 20; attempt++) {
+          const lowerBound = upperBound !== undefined
+            ? Math.max(1, upperBound - windowSize + 1)
+            : undefined;
+          const uidSet = upperBound !== undefined
+            ? `${lowerBound}:${upperBound}`
+            : `${Math.max(1, total - windowSize + 1)}:*`; // first page: newest window
+          allUids = [];
+          for await (const msg of this.client.fetch(uidSet, { uid: true }, { uid: true })) {
+            allUids.push(msg.uid);
+          }
+          const hitFloor = upperBound !== undefined ? (lowerBound as number) <= 1 : (total - windowSize + 1) <= 1;
+          if (allUids.length >= limit || hitFloor) {
+            break;
+          }
+          windowSize *= 2;
+        }
+
+        if (allUids.length === 0) {
+          // FIX (remediation item 5): an empty result here is only a
+          // legitimate empty page when there truly are no UIDs left in the
+          // window. Since uidSet was computed from a live UID search
+          // against the just-opened mailbox (not a stale offset), this is
+          // safe to treat as authoritative — never return an empty page
+          // while claiming a nextCursor exists (checked by the caller).
+          return [];
+        }
+
+        allUids.sort((a, b) => a - b);
+        const pageUids = allUids.slice(-limit); // newest `limit` UIDs in the window
+        const start = pageUids[0];
+        const end = pageUids[pageUids.length - 1];
 
         const messages: EmailMessage[] = [];
 
@@ -1049,7 +1177,7 @@ export class SimpleIMAPService {
           envelope: true,
           bodyStructure: true,
           bodyParts: ['1'],   // TEXT part only (part 1 of multipart, whole body for simple)
-        })) {
+        }, { uid: true })) {
           try {
             const env = message.envelope;
             if (!env) continue;
@@ -1091,6 +1219,15 @@ export class SimpleIMAPService {
               ? this.extractAttachmentMeta(message.bodyStructure)
               : undefined;
 
+            // Only keep messages that are actually within the requested UID
+            // window — the sequence range `start:end` can include UIDs the
+            // window-select above didn't pick (e.g. a message arrived
+            // between the UID scan and this fetch); filtering by
+            // pageUids keeps the page's membership exactly reproducible.
+            if (!pageUids.includes(message.uid)) {
+              continue;
+            }
+
             const listEmail: EmailMessage = {
               id: message.uid.toString(),
               from: fromAddr,
@@ -1122,8 +1259,46 @@ export class SimpleIMAPService {
         }
 
         tags.resultCount = messages.length;
+
+        // Expose the lowest UID actually returned so the caller can build an
+        // exact `beforeUid` cursor for the next page — NOT `start`, in case
+        // some UIDs in [start,end] were expunged/filtered out above.
+        const minUidReturned = messages.length > 0
+          ? Math.min(...messages.map(m => Number(m.id)))
+          : undefined;
+        tags.minUidReturned = minUidReturned;
+
+        // FIX (remediation item 5): also expose whether more UIDs remain
+        // below this page's floor, so the tool layer can decide whether to
+        // emit nextCursor WITHOUT relying on the fragile "page came back
+        // full" heuristic (a genuinely full mailbox page and a
+        // coincidentally-truncated one both satisfy messages.length===limit;
+        // conversely a short final page must never emit a cursor).
+        // UID values are sparse after expunges. A lowest returned UID > 1
+        // does not prove that another message exists below it (Drafts is a
+        // common counterexample), so probe the lower UID range before
+        // advertising a cursor. This prevents a spurious final cursor that
+        // leads to an empty/repeated page.
+        let hasMore = false;
+        if (pageUids.length > 0 && pageUids[0] > 1) {
+          const lowerUids = await this.client.search({ uid: `1:${pageUids[0] - 1}` }, { uid: true });
+          hasMore = Array.isArray(lowerUids) && lowerUids.length > 0;
+        }
+
         logger.info(`Retrieved ${messages.length} emails from ${folder}`, 'IMAPService');
-        return messages.reverse(); // Most recent first
+        const ordered = messages.reverse(); // Most recent first
+        // FIX (2026-08-25): return pagination metadata alongside the page
+        // instead of stashing it in instance state (`this._last...`) — this
+        // instance is shared by every concurrent getEmails() call queued on
+        // enqueueRead, so mutable "last call" fields would be a data race
+        // across interleaved folders/pages. Attach as a non-enumerable
+        // property so existing callers that only care about the array
+        // (e.g. background analytics sync) keep working unchanged.
+        Object.defineProperty(ordered, 'pageMeta', {
+          value: { hasMore, minUidReturned, total },
+          enumerable: false,
+        });
+        return ordered;
       } finally {
         lock.release();
       }
@@ -1243,22 +1418,17 @@ export class SimpleIMAPService {
     try {
       const searchCriteria = buildSearchCriteria(options);
 
-      // Request ESEARCH PARTIAL so the server returns only the first `limit` UIDs
-      // rather than the full result set. Falls back transparently to a plain number[]
-      // on servers that lack ESEARCH capability (e.g. older Proton Bridge builds),
-      // in which case we slice client-side as before.
-      const searchResult = await this.client.search(searchCriteria, {
-        uid: true,
-        returnOptions: [{ partial: `1:${limit}` }],
-      });
+      // FIX (2026-08-25): Proton Bridge currently produces stateful/inconsistent
+      // results for consecutive ESEARCH PARTIAL queries (the first date window
+      // succeeds, later windows can incorrectly return no UIDs). Use ordinary UID
+      // SEARCH and apply the configured result limit locally. Mailboxes are bounded
+      // and this path values correctness over the small ESEARCH bandwidth saving.
+      const searchResult = await this.client.search(searchCriteria, { uid: true });
       const results: EmailMessage[] = [];
 
       let limitedUids: number[];
       if (Array.isArray(searchResult)) {
         limitedUids = (searchResult as number[]).slice(0, limit);
-      } else if (searchResult && typeof searchResult === 'object' && 'partial' in searchResult) {
-        const { messages } = (searchResult as { partial: { messages?: string } }).partial;
-        limitedUids = messages ? expandImapSequence(messages) : [];
       } else {
         limitedUids = [];
       }
@@ -3200,6 +3370,15 @@ export class SimpleIMAPService {
           logger: false,
           tls: tlsOptions,
           connectionTimeout: 30000,
+          // FIX (2026-08-25, mailpouch pagination bug): see the primary connect()
+          // clientInfo above — the idle-notification client shares the same Bridge
+          // connectionlimiter, so it must self-identify too or it lands in the
+          // "unknown" bucket alongside (and contending with) every other unlabeled
+          // connection.
+          clientInfo: {
+            name: 'apple-mail',
+            vendor: 'Apple Inc.',
+          },
         });
 
         // imapflow extends EventEmitter. A socket 'error' emitted with NO

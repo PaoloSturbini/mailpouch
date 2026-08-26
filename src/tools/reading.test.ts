@@ -115,7 +115,7 @@ describe("reading folder provenance", () => {
     });
 
     await expect(handlers.get_emails_by_label(ctx)).rejects.toThrow(/resolved email.*outside/i);
-    expect(getEmails).toHaveBeenCalledWith("Labels/Work", 2, 0);
+    expect(getEmails).toHaveBeenCalledWith("Labels/Work", 2, 0, undefined);
   });
 
   it("requires and verifies attachment folder provenance before returning binary content", async () => {

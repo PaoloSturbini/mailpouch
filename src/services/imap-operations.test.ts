@@ -1439,6 +1439,7 @@ describe("SimpleIMAPService.getEmails", () => {
     (svc as any).client = {
       getMailboxLock: vi.fn().mockResolvedValue(makeLock()),
       mailbox: { exists: 0 },
+      search: vi.fn().mockResolvedValue([]),
     };
 
     expect(await svc.getEmails("INBOX")).toEqual([]);
@@ -1468,7 +1469,8 @@ describe("SimpleIMAPService.getEmails", () => {
     (svc as any).client = {
       getMailboxLock: vi.fn().mockResolvedValue(makeLock()),
       mailbox: { exists: 1 },
-      fetch: vi.fn().mockReturnValue(asyncMessages([mockMsg])),
+      search: vi.fn().mockResolvedValue([]),
+      fetch: vi.fn().mockImplementation(() => asyncMessages([mockMsg])),
     };
 
     const emails = await svc.getEmails("INBOX", 50, 0);
@@ -1493,7 +1495,8 @@ describe("SimpleIMAPService.getEmails", () => {
     (svc as any).client = {
       getMailboxLock: vi.fn().mockResolvedValue(makeLock()),
       mailbox: { exists: 1 },
-      fetch: vi.fn().mockReturnValue(asyncMessages([mockMsgNoEnv])),
+      search: vi.fn().mockResolvedValue([]),
+      fetch: vi.fn().mockImplementation(() => asyncMessages([mockMsgNoEnv])),
     };
 
     const emails = await svc.getEmails("INBOX");
@@ -1501,7 +1504,39 @@ describe("SimpleIMAPService.getEmails", () => {
     expect(emails).toHaveLength(0);
   });
 
-  it("returns [] (not a clamped message #1) when offset is at/beyond the message count", async () => {
+  it("legacy offset param no longer selects a page — always returns the newest window (first page) unless beforeUid is given", async () => {
+    // FIX (2026-08-25, remediation item 1): getEmails() now pages exclusively
+    // by UID watermark (\`beforeUid\`). The \`offset\` parameter is retained ONLY
+    // so cursors minted by a pre-fix server still decode without throwing —
+    // see decodeCursor()/EmailCursor in index.ts. It is NOT used to compute
+    // the IMAP fetch range anymore, so passing a large offset with no
+    // beforeUid does NOT return an empty page; it returns the first (newest)
+    // page, same as offset=0. Callers must supply the \`beforeUid\` returned in
+    // the previous page's cursor to advance past page 1.
+    const svc = new SimpleIMAPService();
+    vi.spyOn(svc as any, "validateFolderName").mockImplementation(() => {});
+    vi.spyOn(svc as any, "ensureConnection").mockResolvedValue(undefined);
+    vi.spyOn(svc as any, "checkAndUpdateUidValidity").mockImplementation(() => {});
+
+    const mockMsg = {
+      uid: 5, flags: new Set(), envelope: { from: [], to: [], cc: [], subject: "s", date: new Date() },
+      bodyStructure: {}, bodyParts: new Map(),
+    };
+    const fetch = vi.fn().mockImplementation((_range: string, opts: any) =>
+      opts?.uid && !opts?.envelope ? asyncMessages([{ uid: 5 }]) : asyncMessages([mockMsg])
+    );
+    (svc as any).client = {
+      getMailboxLock: vi.fn().mockResolvedValue(makeLock()),
+      mailbox: { exists: 5 },
+      search: vi.fn().mockResolvedValue([]),
+      fetch,
+    };
+
+    expect(await svc.getEmails("INBOX", 50, 5)).toHaveLength(1);
+    expect(await svc.getEmails("INBOX", 50, 100)).toHaveLength(1);
+  });
+
+  it("total===0 returns [] without ever calling fetch", async () => {
     const svc = new SimpleIMAPService();
     vi.spyOn(svc as any, "validateFolderName").mockImplementation(() => {});
     vi.spyOn(svc as any, "ensureConnection").mockResolvedValue(undefined);
@@ -1510,15 +1545,12 @@ describe("SimpleIMAPService.getEmails", () => {
     const fetch = vi.fn();
     (svc as any).client = {
       getMailboxLock: vi.fn().mockResolvedValue(makeLock()),
-      mailbox: { exists: 5 },
+      mailbox: { exists: 0 },
+      search: vi.fn().mockResolvedValue([]),
       fetch,
     };
 
-    // offset (5) == total (5): an empty page, not message #1.
-    expect(await svc.getEmails("INBOX", 50, 5)).toEqual([]);
-    // offset beyond total too.
-    expect(await svc.getEmails("INBOX", 50, 100)).toEqual([]);
-    // The Math.max(1,…) clamp must never reach a FETCH for an out-of-range page.
+    expect(await svc.getEmails("INBOX", 50, 0)).toEqual([]);
     expect(fetch).not.toHaveBeenCalled();
   });
 
@@ -1536,7 +1568,8 @@ describe("SimpleIMAPService.getEmails", () => {
     (svc as any).client = {
       getMailboxLock: vi.fn().mockResolvedValue(makeLock()),
       mailbox: { exists: 1 },
-      fetch: vi.fn().mockReturnValue(asyncMessages([mockMsg])),
+      search: vi.fn().mockResolvedValue([]),
+      fetch: vi.fn().mockImplementation(() => asyncMessages([mockMsg])),
     };
 
     const emails = await svc.getEmails("INBOX");
@@ -1555,7 +1588,8 @@ describe("SimpleIMAPService.getEmails", () => {
     (svc as any).client = {
       getMailboxLock: vi.fn().mockResolvedValue(makeLock()),
       mailbox: { exists: 1 },
-      fetch: vi.fn().mockReturnValue(throwingGen()),
+      search: vi.fn().mockResolvedValue([]),
+      fetch: vi.fn().mockImplementation(() => throwingGen()),
     };
 
     await expect(svc.getEmails("INBOX")).rejects.toThrow("fetch failed");
@@ -1588,7 +1622,8 @@ describe("SimpleIMAPService.getEmails", () => {
     (svc as any).client = {
       getMailboxLock: vi.fn().mockResolvedValue(makeLock()),
       mailbox: { exists: 1 },
-      fetch: vi.fn().mockReturnValue(asyncMessages([mockMsg])),
+      search: vi.fn().mockResolvedValue([]),
+      fetch: vi.fn().mockImplementation(() => asyncMessages([mockMsg])),
     };
 
     // Should NOT throw — per-message error is caught and logged
@@ -1604,6 +1639,7 @@ describe("SimpleIMAPService.getEmails", () => {
     (svc as any).client = {
       getMailboxLock: vi.fn().mockResolvedValue(makeLock()),
       mailbox: { exists: 0 },
+      search: vi.fn().mockResolvedValue([]),
     };
 
     // Passing null bypasses default params and triggers ?? 50 / ?? 0 branches at runtime
@@ -1649,7 +1685,8 @@ describe("SimpleIMAPService.getEmails", () => {
     (svc as any).client = {
       getMailboxLock: vi.fn().mockResolvedValue(makeLock()),
       mailbox: { exists: 1 },
-      fetch: vi.fn().mockReturnValue(asyncMessages([mockMsg])),
+      search: vi.fn().mockResolvedValue([]),
+      fetch: vi.fn().mockImplementation(() => asyncMessages([mockMsg])),
     };
 
     const emails = await svc.getEmails("INBOX");
@@ -1683,7 +1720,8 @@ describe("SimpleIMAPService.getEmails", () => {
     (svc as any).client = {
       getMailboxLock: vi.fn().mockResolvedValue(makeLock()),
       mailbox: { exists: 1 },
-      fetch: vi.fn().mockReturnValue(asyncMessages([mockMsg])),
+      search: vi.fn().mockResolvedValue([]),
+      fetch: vi.fn().mockImplementation(() => asyncMessages([mockMsg])),
     };
 
     const emails = await svc.getEmails("INBOX");
@@ -1718,7 +1756,8 @@ describe("SimpleIMAPService.getEmails", () => {
     (svc as any).client = {
       getMailboxLock: vi.fn().mockResolvedValue(makeLock()),
       mailbox: { exists: 1 },
-      fetch: vi.fn().mockReturnValue(asyncMessages([mockMsg])),
+      search: vi.fn().mockResolvedValue([]),
+      fetch: vi.fn().mockImplementation(() => asyncMessages([mockMsg])),
     };
 
     const emails = await svc.getEmails("INBOX");
@@ -1751,7 +1790,8 @@ describe("SimpleIMAPService.getEmails", () => {
     (svc as any).client = {
       getMailboxLock: vi.fn().mockResolvedValue(makeLock()),
       mailbox: { exists: 1 },
-      fetch: vi.fn().mockReturnValue(asyncMessages([mockMsg])),
+      search: vi.fn().mockResolvedValue([]),
+      fetch: vi.fn().mockImplementation(() => asyncMessages([mockMsg])),
     };
 
     const emails = await svc.getEmails("INBOX");
@@ -1785,7 +1825,8 @@ describe("SimpleIMAPService.getEmails", () => {
     (svc as any).client = {
       getMailboxLock: vi.fn().mockResolvedValue(makeLock()),
       mailbox: { exists: 1 },
-      fetch: vi.fn().mockReturnValue(asyncMessages([mockMsg])),
+      search: vi.fn().mockResolvedValue([]),
+      fetch: vi.fn().mockImplementation(() => asyncMessages([mockMsg])),
     };
 
     const emails = await svc.getEmails("INBOX");
@@ -1823,7 +1864,8 @@ describe("SimpleIMAPService.getEmails", () => {
     (svc as any).client = {
       getMailboxLock: vi.fn().mockResolvedValue(makeLock()),
       mailbox: { exists: 1 },
-      fetch: vi.fn().mockReturnValue(asyncMessages([mockMsg])),
+      search: vi.fn().mockResolvedValue([]),
+      fetch: vi.fn().mockImplementation(() => asyncMessages([mockMsg])),
     };
 
     const emails = await svc.getEmails("INBOX");
@@ -1860,7 +1902,8 @@ describe("SimpleIMAPService.getEmails", () => {
     (svc as any).client = {
       getMailboxLock: vi.fn().mockResolvedValue(makeLock()),
       mailbox: { exists: 1 },
-      fetch: vi.fn().mockReturnValue(asyncMessages([mockMsg])),
+      search: vi.fn().mockResolvedValue([]),
+      fetch: vi.fn().mockImplementation(() => asyncMessages([mockMsg])),
     };
 
     const emails = await svc.getEmails("INBOX");

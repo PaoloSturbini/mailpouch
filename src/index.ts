@@ -688,14 +688,37 @@ function getAnalyticsEmailsForAccount(
 
 interface EmailCursor {
   folder: string;
-  offset: number;
+  offset?: number;
+  beforeUid?: number;
   limit: number;
+  account?: string;
+  sort?: "date_desc";
 }
 
 function encodeCursor(c: EmailCursor): string {
   return Buffer.from(JSON.stringify(c)).toString("base64url");
 }
 
+// FIX (2026-08-25, mailpouch pagination bug — remediation item 1): a cursor
+// must be a fully autonomous descriptor of "where to resume", independent of
+// any server-side global/ambient state (selected mailbox, connection, etc).
+// Previously it carried only {folder, offset, limit} — no account binding, and
+// offset paginated by IMAP sequence number, which drifts under concurrent
+// mailbox changes (see the getEmails() rewrite in simple-imap-service.ts).
+// The cursor now also carries: `account` (so a cursor minted for one account
+// can never be silently replayed against a different one — checked by the
+// caller in reading.ts), `beforeUid` (the UID watermark — immutable and
+// monotonic for the life of a UIDVALIDITY epoch, unlike a sequence-derived
+// offset), and `sort` (documents the ordering the cursor assumes; today only
+// "date_desc" — the newest-first order getEmails() always returns — exists,
+// but a future sort option must not be allowed to silently reuse a cursor
+// minted under a different order).
+//
+// Backward compatibility: a cursor minted by the pre-fix server (or a cursor
+// without `beforeUid`) still decodes and is honored via the legacy offset
+// path in reading.ts, so in-flight pagination sessions across a deploy don't
+// hard-fail — they just fall back to the (less robust) offset semantics for
+// that one page, then mint a proper beforeUid cursor for every following page.
 function decodeCursor(token: string): EmailCursor | null {
   try {
     const parsed = JSON.parse(Buffer.from(token, "base64url").toString());
@@ -703,11 +726,15 @@ function decodeCursor(token: string): EmailCursor | null {
       parsed !== null &&
       typeof parsed === "object" &&
       typeof parsed.folder === "string" &&
-      typeof parsed.offset === "number" && parsed.offset >= 0 &&
       typeof parsed.limit === "number" && parsed.limit >= 1 && parsed.limit <= 200
     ) {
       // Validate folder to prevent path traversal via crafted cursor tokens.
       if (validateTargetFolder(parsed.folder) !== null) return null;
+      const hasOffset = typeof parsed.offset === "number" && parsed.offset >= 0;
+      const hasBeforeUid = typeof parsed.beforeUid === "number" && parsed.beforeUid >= 1;
+      if (!hasOffset && !hasBeforeUid) return null;
+      if (parsed.account !== undefined && typeof parsed.account !== "string") return null;
+      if (parsed.sort !== undefined && parsed.sort !== "date_desc") return null;
       return parsed as EmailCursor;
     }
     return null;

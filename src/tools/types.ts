@@ -134,8 +134,14 @@ export interface ToolCallContext {
   sendProgress: (progress: number, total: number, message: string) => Promise<void>;
 
   /** Shared cursors (email-list pagination). */
-  encodeCursor: (c: { folder: string; offset: number; limit: number }) => string;
-  decodeCursor: (token: string) => { folder: string; offset: number; limit: number } | null;
+  // FIX (2026-08-25, remediation item 1): cursor is now a fully self-contained
+  // descriptor (see EmailCursor / decodeCursor in index.ts) — offset/beforeUid
+  // are both optional (exactly one is expected to be set depending on whether
+  // the cursor came from the legacy offset path or the new UID-watermark path),
+  // plus account + sort so a cursor can't be silently misapplied cross-account
+  // or under a different ordering.
+  encodeCursor: (c: { folder: string; offset?: number; beforeUid?: number; limit: number; account?: string; sort?: "date_desc" }) => string;
+  decodeCursor: (token: string) => { folder: string; offset?: number; beforeUid?: number; limit: number; account?: string; sort?: "date_desc" } | null;
 
   /** Analytics cache warmer — shared across handlers that need it. */
   getAnalyticsEmails: () => Promise<{ inbox: EmailMessage[]; sent: EmailMessage[] }>;

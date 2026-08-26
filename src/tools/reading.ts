@@ -410,6 +410,36 @@ export const defsLate: ToolDef[] = [
     },
   },
   {
+    // FIX (2026-08-25, remediation item 7): the original fts_rebuild only ever
+    // covers messages the analytics layer has cached, which is capped at 200
+    // INBOX + 100 Sent (see AnalyticsService/sync_emails) — structurally unable
+    // to index a 10k+ message, many-folder mailbox (observed: 330 messages
+    // indexed out of 10,189). This tool walks every folder with the corrected
+    // UID-cursor pagination (see getEmails() / get_emails fix) and indexes the
+    // full corpus, not just the analytics-cache subset.
+    name: "fts_rebuild_full",
+    title: "Rebuild Local FTS Index (Full Mailbox)",
+    description: "Clear the local FTS5 index and rebuild it from EVERY message in EVERY folder (via IMAP, using UID-paginated get_emails), not just the INBOX+Sent analytics cache used by fts_rebuild. Use this after mailpouch-imap-clientinfo-2026-08-25 remediation, or whenever fts_status message count is far below get_folders' total. May take several minutes for large mailboxes; indexes incrementally per folder so a mid-run failure still leaves earlier folders indexed.",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    inputSchema: {
+      type: "object",
+      properties: {
+        folders: { type: "array", items: { type: "string" }, description: "Optional explicit folder list; defaults to all folders from get_folders()." },
+        batchSize: { type: "number", description: "Messages fetched per IMAP page per folder (default 50, max 200)." },
+      },
+    },
+    outputSchema: {
+      type: "object",
+      properties: {
+        indexed: { type: "number" },
+        folderResults: { type: "array" },
+        messageCount: { type: "number" },
+        dbPath: { type: "string" },
+        durationMs: { type: "number" },
+      },
+    },
+  },
+  {
     name: "fts_status",
     title: "FTS Index Status",
     description: "Report the path, row count, and on-disk size of the local FTS5 index. Returns { available: false } when better-sqlite3 is not installed.",
@@ -578,7 +608,7 @@ function requireResolvedSearchEmailInAllowedScope(
 
 export const handlers: Record<string, ToolHandler> = {
   get_emails: async (ctx) => {
-    const { args, imapService, ok, limits, encodeCursor, decodeCursor } = ctx;
+    const { args, imapService, ok, limits, encodeCursor, decodeCursor, accountId } = ctx;
     const folder = (args.folder as string) || "INBOX";
     const geValidErr = validateTargetFolder(folder);
     if (geValidErr) throw new McpError(ErrorCode.InvalidParams, geValidErr);
@@ -587,23 +617,42 @@ export const handlers: Record<string, ToolHandler> = {
     if (args.limit !== undefined && typeof args.limit !== "number") {
       throw new McpError(ErrorCode.InvalidParams, "'limit' must be a number.");
     }
-    const limit = Math.min(Math.max(1, (args.limit as number) || 50), 200, limits.maxEmailListResults);
+    const requestedLimit = (args.limit as number) || 50;
+    const limit = Math.min(Math.max(1, requestedLimit), 200, limits.maxEmailListResults);
+    // FIX (2026-08-25, remediation item 4): tell the caller explicitly when the
+    // requested limit was clamped, instead of silently truncating. Surfaced as
+    // a response field (see `structured` below), not just a log line, so a
+    // programmatic caller doing bulk enumeration can detect and adapt instead
+    // of quietly under-fetching (this is what made `get_emails(limit: 200)`
+    // look like a bug rather than a documented cap).
+    const limitClamped = limit < requestedLimit;
 
     if (args.cursor !== undefined && typeof args.cursor !== "string") {
       throw new McpError(ErrorCode.InvalidParams, "'cursor' must be a string.");
     }
+    // FIX (2026-08-25, remediation item 1): cursor is now a fully self-contained
+    // descriptor — account + folder + UID watermark + sort order + limit — so it
+    // can never silently apply to the wrong mailbox/account, and never depends
+    // on ambient/global "currently selected folder" state. offset is retained
+    // ONLY for backward-compat with any cursor minted by the pre-fix server
+    // (best-effort; such a cursor may still be inaccurate — see decodeCursor).
+    let beforeUid: number | undefined;
     let offset = 0;
     if (args.cursor) {
       const decoded = decodeCursor(args.cursor as string);
-      if (!decoded || decoded.folder !== folder) {
+      if (!decoded || decoded.folder !== folder || (decoded.account && decoded.account !== accountId)) {
         return { content: [{ type: "text" as const, text: "Invalid or expired cursor" }], isError: true };
       }
-      offset = decoded.offset;
+      if (decoded.beforeUid !== undefined) {
+        beforeUid = decoded.beforeUid;
+      } else {
+        offset = decoded.offset ?? 0;
+      }
     }
 
     let emails;
     try {
-      emails = await imapService.getEmails(folder, limit, offset);
+      emails = await imapService.getEmails(folder, limit, offset, beforeUid);
     } catch (err) {
       // Cluster 6: a SELECT of a missing mailbox surfaces as an opaque imapflow
       // rejection. Convert it to a precise, actionable not-found error.
@@ -614,9 +663,25 @@ export const handlers: Record<string, ToolHandler> = {
     }
     for (const email of emails) requireResolvedEmailInAllowedFolder(email, allowedFolders, folder);
 
+    // FIX (2026-08-25, remediation item 5): derive "more pages exist" from the
+    // IMAP layer's own UID-window accounting (pageMeta.hasMore) instead of the
+    // `emails.length === limit` heuristic. That heuristic silently broke
+    // pagination whenever a page came back short for a reason OTHER than "this
+    // is the last page" (parse failures dropped from `messages`, a concurrent
+    // mailbox change shrinking the sequence window under the old offset-based
+    // code) — the caller would stop enumerating with UIDs still unread and no
+    // way to know it. It also risked the opposite error: never emit a
+    // nextCursor for an incomplete page, and never claim an empty page while
+    // UIDs remain (both explicitly required).
+    const pageMeta = (emails as unknown as { pageMeta?: { hasMore: boolean; minUidReturned?: number; total: number } }).pageMeta;
+    const hasMore = pageMeta ? pageMeta.hasMore : emails.length === limit;
+    const isCompletePage = emails.length === limit || !hasMore;
     let nextCursor: string | undefined;
-    if (emails.length === limit) {
-      nextCursor = encodeCursor({ folder, offset: offset + limit, limit });
+    if (hasMore && isCompletePage) {
+      const nextBeforeUid = pageMeta?.minUidReturned;
+      nextCursor = nextBeforeUid !== undefined
+        ? encodeCursor({ folder, account: accountId, beforeUid: nextBeforeUid, limit, sort: "date_desc" })
+        : encodeCursor({ folder, account: accountId, offset: offset + limit, limit, sort: "date_desc" });
     }
 
     // #8: projection — drop the body fields for lean listing/triage payloads.
@@ -624,7 +689,13 @@ export const handlers: Record<string, ToolHandler> = {
       ? emails.map((e) => { const { body: _b, bodyPreview: _p, ...rest } = e; void _b; void _p; return rest; })
       : emails;
 
-    const structured = { emails: projected, folder, count: projected.length, ...(nextCursor ? { nextCursor } : {}) };
+    const structured = {
+      emails: projected,
+      folder,
+      count: projected.length,
+      ...(nextCursor ? { nextCursor } : {}),
+      ...(limitClamped ? { limitApplied: limit, requestedLimit, limitClampedReason: `Effective max page size is ${limits.maxEmailListResults} (configured maxEmailListResults / 200 hard cap).` } : {}),
+    };
     return ok(structured);
   },
 
@@ -662,7 +733,25 @@ export const handlers: Record<string, ToolHandler> = {
     const requestedSearchFolders = searchOptions.folders ?? [searchOptions.folder ?? "INBOX"];
     for (const email of results) requireResolvedSearchEmailInAllowedScope(email, requestedSearchFolders, allowedFolders);
     const searchedIn = searchOptions.folders ? searchOptions.folders.join(", ") : (searchOptions.folder ?? "INBOX");
-    return ok({ emails: results, count: results.length, folder: searchedIn });
+    // searchSingleFolder parses complete RFC messages so local filters can be
+    // evaluated correctly. Do not expose those full bodies in a list response:
+    // a handful of HTML messages can exceed the MCP response guard and make a
+    // successful search appear as an empty result. Project only the fields in
+    // the search_emails contract and keep a short preview.
+    const projected = results.map((email) => ({
+      id: email.id,
+      messageId: email.messageId,
+      from: email.from,
+      to: email.to,
+      subject: email.subject,
+      date: email.date,
+      folder: email.folder,
+      isRead: email.isRead,
+      isStarred: email.isStarred,
+      hasAttachment: email.hasAttachment,
+      bodyPreview: (email.bodyPreview ?? email.body ?? "").slice(0, 300),
+    }));
+    return ok({ emails: projected, count: projected.length, folder: searchedIn });
   },
 
   get_unread_count: async (ctx) => {
@@ -685,7 +774,7 @@ export const handlers: Record<string, ToolHandler> = {
   },
 
   get_emails_by_label: async (ctx) => {
-    const { args, imapService, ok, limits, encodeCursor, decodeCursor } = ctx;
+    const { args, imapService, ok, limits, encodeCursor, decodeCursor, accountId } = ctx;
     if (!args.label || typeof args.label !== "string") {
       throw new McpError(ErrorCode.InvalidParams, "'label' is required and must be a string.");
     }
@@ -698,23 +787,33 @@ export const handlers: Record<string, ToolHandler> = {
     if (args.limit !== undefined && typeof args.limit !== "number") {
       throw new McpError(ErrorCode.InvalidParams, "'limit' must be a number.");
     }
-    const lblLimit = Math.min(Math.max(1, (args.limit as number) || 50), 200, limits.maxEmailListResults);
+    const lblRequestedLimit = (args.limit as number) || 50;
+    const lblLimit = Math.min(Math.max(1, lblRequestedLimit), 200, limits.maxEmailListResults);
+    const lblLimitClamped = lblLimit < lblRequestedLimit;
 
     if (args.cursor !== undefined && typeof args.cursor !== "string") {
       throw new McpError(ErrorCode.InvalidParams, "'cursor' must be a string.");
     }
+    // FIX (2026-08-25): same self-contained UID cursor as get_emails — see the
+    // comments there. get_emails_by_label shares the exact same underlying
+    // IMAP pagination bug (it calls the same imapService.getEmails()).
+    let lblBeforeUid: number | undefined;
     let lblOffset = 0;
     if (args.cursor) {
       const decoded = decodeCursor(args.cursor as string);
-      if (!decoded || decoded.folder !== lblFolder) {
+      if (!decoded || decoded.folder !== lblFolder || (decoded.account && decoded.account !== accountId)) {
         return { content: [{ type: "text" as const, text: "Invalid or expired cursor" }], isError: true };
       }
-      lblOffset = decoded.offset;
+      if (decoded.beforeUid !== undefined) {
+        lblBeforeUid = decoded.beforeUid;
+      } else {
+        lblOffset = decoded.offset ?? 0;
+      }
     }
 
     let lblEmails;
     try {
-      lblEmails = await imapService.getEmails(lblFolder, lblLimit, lblOffset);
+      lblEmails = await imapService.getEmails(lblFolder, lblLimit, lblOffset, lblBeforeUid);
     } catch (err) {
       // Cluster 6: a missing label folder maps to a precise not-found message
       // naming the label, rather than the opaque "An error occurred".
@@ -724,12 +823,24 @@ export const handlers: Record<string, ToolHandler> = {
       throw err;
     }
     for (const email of lblEmails) requireResolvedEmailInAllowedFolder(email, allowedFolders, lblFolder);
+    const lblPageMeta = (lblEmails as unknown as { pageMeta?: { hasMore: boolean; minUidReturned?: number; total: number } }).pageMeta;
+    const lblHasMore = lblPageMeta ? lblPageMeta.hasMore : lblEmails.length === lblLimit;
+    const lblIsCompletePage = lblEmails.length === lblLimit || !lblHasMore;
     let lblNextCursor: string | undefined;
-    if (lblEmails.length === lblLimit) {
-      lblNextCursor = encodeCursor({ folder: lblFolder, offset: lblOffset + lblLimit, limit: lblLimit });
+    if (lblHasMore && lblIsCompletePage) {
+      const lblNextBeforeUid = lblPageMeta?.minUidReturned;
+      lblNextCursor = lblNextBeforeUid !== undefined
+        ? encodeCursor({ folder: lblFolder, account: accountId, beforeUid: lblNextBeforeUid, limit: lblLimit, sort: "date_desc" })
+        : encodeCursor({ folder: lblFolder, account: accountId, offset: lblOffset + lblLimit, limit: lblLimit, sort: "date_desc" });
     }
 
-    const lblStructured = { emails: lblEmails, folder: lblFolder, count: lblEmails.length, ...(lblNextCursor ? { nextCursor: lblNextCursor } : {}) };
+    const lblStructured = {
+      emails: lblEmails,
+      folder: lblFolder,
+      count: lblEmails.length,
+      ...(lblNextCursor ? { nextCursor: lblNextCursor } : {}),
+      ...(lblLimitClamped ? { limitApplied: lblLimit, requestedLimit: lblRequestedLimit, limitClampedReason: `Effective max page size is ${limits.maxEmailListResults} (configured maxEmailListResults / 200 hard cap).` } : {}),
+    };
     return ok(lblStructured);
   },
 
@@ -966,6 +1077,85 @@ export const handlers: Record<string, ToolHandler> = {
       const indexed = fts.rebuild([...inbox, ...sent].map(recordFromEmail));
       const stats = fts.stats();
       return ok({ indexed, messageCount: stats.messageCount, dbPath: stats.dbPath });
+    } finally {
+      _ftsRebuilding.delete(dbPath);
+    }
+  },
+
+  fts_rebuild_full: async (ctx) => {
+    // FIX (2026-08-25, remediation item 7): getAnalyticsEmails() (used by
+    // fts_rebuild above) is capped at 200 INBOX + 100 Sent by the analytics
+    // sync layer — structurally unable to index a full 10k+ message, many-
+    // folder mailbox. This walks every folder via imapService.getEmails()
+    // with the corrected UID-cursor pagination.
+    const { ok, args, getFts, imapService, recordFromEmail } = ctx;
+    const fts = getFts();
+    const dbPath = fts.stats().dbPath;
+    if (_ftsRebuilding.has(dbPath)) {
+      return { content: [{ type: "text" as const, text: "FTS rebuild already in progress — try again in a moment." }], isError: true };
+    }
+    _ftsRebuilding.add(dbPath);
+    const startedAt = Date.now();
+    try {
+      let folders: string[] | undefined = Array.isArray((args as { folders?: unknown })?.folders) && ((args as { folders?: unknown[] }).folders as unknown[]).length > 0
+        ? (args as { folders: string[] }).folders
+        : undefined;
+      if (!folders) {
+        const allFolders = await imapService.getFolders();
+        // getFolders() returns folder descriptors; normalize to path strings
+        // the same way get_emails expects (matches sync_folders' shape).
+        folders = allFolders.map((f) => (typeof f === "string" ? f : (f as { path: string }).path));
+      }
+      const batchSize = Math.min(Math.max(1, (args as { batchSize?: number })?.batchSize || 50), 200);
+      const allRecords: ReturnType<typeof recordFromEmail>[] = [];
+      const folderResults: Array<{ folder: string; indexed: number; error?: string }> = [];
+      for (const folder of folders) {
+        let beforeUid: number | undefined;
+        let folderCount = 0;
+        let pages = 0;
+        const seenUids = new Set<string>();
+        // Safety valve: cap pages per folder so a pathological folder can't
+        // hang the whole rebuild indefinitely; 10,189 msgs / 50 per page is
+        // ~204 pages, so 5000 pages (250k messages) is a generous ceiling.
+        const MAX_PAGES_PER_FOLDER = 5000;
+        while (pages < MAX_PAGES_PER_FOLDER) {
+          pages++;
+          let pageEmails;
+          try {
+            pageEmails = await imapService.getEmails(folder, batchSize, 0, beforeUid);
+          } catch (err) {
+            folderResults.push({ folder, indexed: folderCount, error: String((err as Error)?.message ?? err) });
+            break;
+          }
+          if (!pageEmails || pageEmails.length === 0) break;
+          for (const m of pageEmails) {
+            // Dedup guard: even with UID-based paging, defensively skip a
+            // UID we've already indexed this run rather than double-count.
+            const key = `${folder}:${m.id}`;
+            if (seenUids.has(key)) continue;
+            seenUids.add(key);
+            allRecords.push(recordFromEmail(m));
+            folderCount++;
+          }
+          const pageMeta = (pageEmails as unknown as { pageMeta?: { hasMore: boolean; minUidReturned?: number } }).pageMeta;
+          if (!pageMeta || !pageMeta.hasMore) break;
+          beforeUid = pageMeta.minUidReturned;
+          if (beforeUid === undefined) break;
+        }
+        if (!folderResults.find((r) => r.folder === folder)) {
+          folderResults.push({ folder, indexed: folderCount });
+        }
+      }
+      // PARSE-003: same atomic clear+repopulate semantics as fts_rebuild.
+      const indexed = fts.rebuild(allRecords);
+      const stats = fts.stats();
+      return ok({
+        indexed,
+        folderResults,
+        messageCount: stats.messageCount,
+        dbPath: stats.dbPath,
+        durationMs: Date.now() - startedAt,
+      });
     } finally {
       _ftsRebuilding.delete(dbPath);
     }
